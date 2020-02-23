@@ -8,10 +8,12 @@
 #include "string.h"
 #include "stdint.h"
 
-
 #include "../picohttpparser.h"
+#include "../re.h"
 
-#define NUMBER_HANDLER_THREADS	2
+
+#define REQUESTS_QUEUE_LEN		16
+#define NUMBER_HANDLER_THREADS	1
 
 const static char indexdata[] =
 "<html> \
@@ -24,47 +26,67 @@ This is a small test page. \
 const static char http_html_hdr[] =
 "Content-type: text/html\r\n\r\n";
 
+typedef struct 
+{
+	struct netconn 		*conn;
+	char 				*inbuf;
+	struct phr_header 	*headers;
+	size_t 				headers_len;
+	int32_t 			num_headers;
+	char				path[32];
+} request_t;
 
-static void CreateRequestHandlers();
+// ------------------------------------------------------
+// Routing table typedefs
+// ------------------------------------------------------
+typedef struct regex_t* re_t;
+typedef int32_t (*endpoint_handler_t)(request_t *request);
 
+typedef struct {
+	char re_pattern[32];
+	endpoint_handler_t handler;
+} route_t;
 
+// ------------------------------------------------------
+// Function prototypes
+// ------------------------------------------------------
+static int32_t StartRequestHandlers();
+static int32_t InitIncomingConn(struct netconn **conn);
 
 static void StartRequestHandlerTask(void *argument);
 static void process_connection(struct netconn *conn);
 
+static int32_t RegisterRoutes();
+static int32_t RegisterRoute(char *re_pattern, endpoint_handler_t handler);
+static int32_t RouteDefault(request_t *request);
+static int32_t RouteFileSys(request_t *request);
+
+// ------------------------------------------------------
+// Global variables
+// ------------------------------------------------------
 static QueueHandle_t requests_q;
-typedef struct 
-{
-	struct netconn *conn;
-} request_t;
+
+#define MAX_ROUTES	16
+static route_t routes[MAX_ROUTES];
+static uint32_t num_routes = 0;
 
 void StartHttpTask(void *argument)
 {
-	printf("[HttpTask] Started\r\n");
-
 	struct netconn *conn, *newconn;
 	request_t request; 
+	int32_t r;
 
+	printf("[HttpTask] Started\r\n");
+	
 	// Initialize Request Handler tasks
-
-
-
-	conn = netconn_new(NETCONN_TCP);
-	if(conn == NULL) 
-	{
-		printf("[HttpTask] Conn initialized OK\r\n");
+	if((r = StartRequestHandlers()) < 0) {
+		printf("[HttpTask] Failed to start request handler tasks: %d\r\n", (int)r);
 		_Error_Handler(__FILE__, __LINE__);
 	}
 
-	if(netconn_bind(conn, NULL, 80) != ERR_OK)
-	{
-		printf("[HttpTask] Failed to bind port\r\n");
-		_Error_Handler(__FILE__, __LINE__);
-	}
-
-	if(netconn_listen(conn) != ERR_OK)
-	{
-		printf("[HttpTask] Failed to start listening\r\n");
+	// Setup incommong connections listener
+	if((r = InitIncomingConn(&conn)) < 0) {
+		printf("[HttpTask] Failed to create incomming connection: %d\r\n", (int)r);
 		_Error_Handler(__FILE__, __LINE__);
 	}
 
@@ -93,50 +115,68 @@ void StartHttpTask(void *argument)
 	}
 }
 
-void CreateRequestHandlers()
+int32_t StartRequestHandlers()
 {
-	requests_q = xQueueCreate(16, sizeof(request_t));
+	requests_q = xQueueCreate(REQUESTS_QUEUE_LEN, sizeof(struct netconn *));
 	if(requests_q == NULL) {
-		printf("[HttpTask] Failed to initialize requests queue\r\n");
-		_Error_Handler(__FILE__, __LINE__);
+		return -1;
 	}
 
-	char task_name[32];
-	for(int i = 0; i < NUMBER_HANDLER_THREADS; i++) 
-	{
+	char task_name[16];
+	for(int i = 0; i < NUMBER_HANDLER_THREADS; i++) {
 		sprintf(task_name, "ReqHandler-%d", i);
-		if(xTaskCreate(StartRequestHandlerTask, task_name, 2048, NULL, tskIDLE_PRIORITY + 3, NULL) != pdPASS)
-		{
-			printf("[HttpTask] Failed to start handler task\r\n");
-			_Error_Handler(__FILE__, __LINE__);
+		if(xTaskCreate(StartRequestHandlerTask, task_name, 2048, NULL, tskIDLE_PRIORITY + 3, NULL) != pdPASS) {
+			return -2;
 		}
 	}
+
+	RegisterRoutes();
+
+	return 0;
 }
+
+int32_t InitIncomingConn(struct netconn **conn)
+{
+	*conn = netconn_new(NETCONN_TCP);
+	if(*conn == NULL) {
+		return -1;
+	}
+
+	if(netconn_bind(*conn, NULL, 80) != ERR_OK) {
+		return -2;
+	}
+
+	if(netconn_listen(*conn) != ERR_OK) {
+		return -3;
+	}
+
+	return 0;
+}
+
 
 void StartRequestHandlerTask(void *argument)
 {
+	struct netconn *conn;
 	char *name = pcTaskGetName(NULL);
+
 	printf("[%s] Started\r\n", name);
 
-	request_t request;
-
-	if(requests_q == NULL) 
-	{
+	if(requests_q == NULL) {
 		printf("[%s] Requests Queue is NULL\r\n", name);
 		_Error_Handler(__FILE__, __LINE__);
 	}
 
 	while(1) 
 	{
-		if(xQueueReceive(requests_q, &request, portMAX_DELAY))
+		if(xQueueReceive(requests_q, &conn, portMAX_DELAY))
 		{
 			printf("[%s] Got request to process\r\n", name);
-			if(request.conn != NULL) 
+			if(conn != NULL) 
 			{
 				osDelay(50);
-				process_connection(request.conn);
-				netconn_close(request.conn);
-				netconn_delete(request.conn);
+				process_connection(conn);
+				netconn_close(conn);
+				netconn_delete(conn);
 			}
 		}
 	}
@@ -152,10 +192,14 @@ static void process_connection(struct netconn *conn)
 	uint16_t len;
 	err_t err = 0;
 
-	// Pico
+	// Header parser
 	const char *method, *path;
-	int pret, minor_version;
+	int headers_len, minor_version;
 	size_t buflen = 0, prevbuflen = 0, method_len, path_len, num_headers;
+
+	// Request
+	request_t req;
+
 
 	if(conn == NULL)
 	{
@@ -184,15 +228,15 @@ static void process_connection(struct netconn *conn)
 		buflen += len;
 
 		num_headers = sizeof(headers) / sizeof(headers[0]);
-		pret = phr_parse_request(buf, buflen, &method, &method_len, &path, &path_len,
+		headers_len = phr_parse_request(buf, buflen, &method, &method_len, &path, &path_len,
                              &minor_version, headers, &num_headers, prevbuflen);
 
-		if(pret > 0)
+		if(headers_len > 0)
 		{
 			printf("[%s] Buffer parsed OK\r\n", pcTaskGetName(NULL));
 			break;
 		}
-    	else if(pret == -1) 
+    	else if(headers_len == -1) 
 		{
 			printf("[%s] Buffer parse Failure\r\n", pcTaskGetName(NULL));
 			return;
@@ -205,7 +249,7 @@ static void process_connection(struct netconn *conn)
 		}
 	}
 
-	printf("[%s] Header is %d bytes long\n", pcTaskGetName(NULL), pret);
+	printf("[%s] Header is %d bytes long\n", pcTaskGetName(NULL), headers_len);
 	printf("[%s] Method is %.*s\n", pcTaskGetName(NULL), (int)method_len, method);
 	printf("[%s] Path is %.*s\n", pcTaskGetName(NULL), (int)path_len, path);
 	printf("[%s] HTTP version is 1.%d\n", pcTaskGetName(NULL), minor_version);
@@ -215,8 +259,80 @@ static void process_connection(struct netconn *conn)
 		printf("\t%.*s: %.*s\n", (int)headers[i].name_len, headers[i].name,
 			(int)headers[i].value_len, headers[i].value);
 	}
+	
+	req.conn = conn;
+	req.inbuf = buf;
+	req.headers = headers;
+	req.headers_len = headers_len;
+	req.num_headers = num_headers;
+	memcpy(req.path, path, (size_t)path_len);
+	req.path[path_len] = 0;
 
-	printf("\r\n[%s] Send response\r\n", pcTaskGetName(NULL));
-	netconn_write(conn, http_html_hdr, sizeof(http_html_hdr), NETCONN_NOCOPY);
-	netconn_write(conn, indexdata, sizeof(indexdata), NETCONN_NOCOPY);
+	// Find route, if no route found, pass to default route
+	printf("[%s] Search for routes, for:%s\r\n",pcTaskGetName(NULL),req.path);
+	route_t *route = NULL;
+	for(int i = 0; i < num_routes; i++)
+	{
+		int match = re_match(routes[i].re_pattern, req.path);
+		printf("[%s] (%d) Checking handler for [%s], match:%d\r\n",pcTaskGetName(NULL), i, req.path, match);
+		if(match >= 0) {
+			printf("[%s] Route handler found\r\n",pcTaskGetName(NULL));
+			route = &routes[i];
+			break;
+		}
+	}
+
+	if(route != NULL) {
+		route->handler(&req);
+	}
+	else {
+		printf("[%s] No handler found, calling default route\r\n",pcTaskGetName(NULL));
+		RouteDefault(&req);
+	}
+}
+
+int32_t RegisterRoutes()
+{
+	RegisterRoute("/$", RouteFileSys);
+	RegisterRoute("/api", RouteFileSys);
+	RegisterRoute("/file.txt", RouteFileSys);
+
+	return 0;
+}
+
+
+int32_t RegisterRoute(char *re_pattern, endpoint_handler_t handler)
+{
+	if(num_routes >= MAX_ROUTES) {
+		return -1;
+	}
+
+	strncpy(routes[num_routes].re_pattern, re_pattern, 32 - 1);
+	routes[num_routes].handler = handler;
+	num_routes++;
+
+	return 0;
+}
+
+int32_t RouteDefault(request_t *req)
+{
+	printf("[%s] Default route called\r\n", pcTaskGetName(NULL));
+	printf("[%s] Path:%s\r\n", pcTaskGetName(NULL), req->path);
+
+	netconn_write(req->conn, http_html_hdr, sizeof(http_html_hdr), NETCONN_NOCOPY);
+	netconn_write(req->conn, indexdata, sizeof(indexdata), NETCONN_NOCOPY);
+
+
+	return 0;
+}
+
+int32_t RouteFileSys(request_t *req)
+{
+	printf("[%s] RouteFileSys route called\r\n", pcTaskGetName(NULL));
+	printf("[%s] Path:%s\r\n", pcTaskGetName(NULL), req->path);
+
+	netconn_write(req->conn, http_html_hdr, sizeof(http_html_hdr), NETCONN_NOCOPY);
+	netconn_write(req->conn, indexdata, sizeof(indexdata), NETCONN_NOCOPY);
+
+	return 0;
 }

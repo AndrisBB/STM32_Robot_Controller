@@ -161,7 +161,8 @@ Middlewares/Third_Party/LwIP/src/netif/ppp/magic.c \
 Src/syscalls.c \
 Src/tasks/default_task.c \
 Src/tasks/http_task.c \
-Src/picohttpparser.c
+Src/picohttpparser.c \
+Src/re.c
 
 # ASM sources
 ASM_SOURCES =  \
