@@ -1,1 +1,1 @@
-InMoov_Controller
+Firmware for the STM32 based servo controler
